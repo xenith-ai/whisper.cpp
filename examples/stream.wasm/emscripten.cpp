@@ -31,7 +31,7 @@ void stream_set_status(const std::string & status) {
     g_status = status;
 }
 
-void stream_main(size_t index) {
+void stream_main(size_t index, int interval) {
     stream_set_status("loading data ...");
 
     struct whisper_full_params wparams = whisper_full_default_params(whisper_sampling_strategy::WHISPER_SAMPLING_GREEDY);
@@ -62,7 +62,7 @@ void stream_main(size_t index) {
     auto & ctx = g_contexts[index];
 
     // 5 seconds interval
-    const int64_t window_samples = 5*WHISPER_SAMPLE_RATE;
+    const int64_t window_samples = interval*WHISPER_SAMPLE_RATE;
 
     while (g_running) {
         stream_set_status("waiting for audio ...");
@@ -129,7 +129,7 @@ void stream_main(size_t index) {
 }
 
 EMSCRIPTEN_BINDINGS(stream) {
-    emscripten::function("init", emscripten::optional_override([](const std::string & path_model) {
+    emscripten::function("init", emscripten::optional_override([](const std::string & path_model, int interval) {
         for (size_t i = 0; i < g_contexts.size(); ++i) {
             if (g_contexts[i] == nullptr) {
                 g_contexts[i] = whisper_init_from_file_with_params(path_model.c_str(), whisper_context_default_params());
@@ -138,8 +138,8 @@ EMSCRIPTEN_BINDINGS(stream) {
                     if (g_worker.joinable()) {
                         g_worker.join();
                     }
-                    g_worker = std::thread([i]() {
-                        stream_main(i);
+                    g_worker = std::thread([i, interval]() {
+                        stream_main(i, interval);
                     });
 
                     return i + 1;
