@@ -22,7 +22,6 @@ std::mutex g_mutex;
 std::thread g_worker;
 
 std::atomic<bool> g_running(false);
-std::atomic<bool> g_is_final_frame(false);
 
 std::string g_status        = "";
 std::string g_status_forced = "";
@@ -84,20 +83,11 @@ std::string join_words(const std::vector<std::string> &words, size_t start = 0) 
 }
 
 // **Deduplication Function**
-std::string deduplicate_transcription(const std::string &new_text, bool is_final_frame) {
+std::string deduplicate_transcription(const std::string &new_text) {
+    // **Step 1: Remove last word from transcription to avoid cutoff words**
     std::vector<std::string> new_words = split_words(new_text);
-
-    // **Step 1: If it's NOT the final frame, remove the last word to prevent cutoff issues**
-    if (!is_final_frame && !new_words.empty()) {
+    if (!new_words.empty()) {
         new_words.pop_back();
-    }
-
-    // **Step 2: Handle the final frame case**
-    if (is_final_frame) {
-        last_transcribed.clear(); // Clear previous transcription
-        g_pcmf32.clear(); // Clear the 1-second buffer AFTER processing the final frame
-        g_is_final_frame = false; // Reset final frame flag
-        return join_words(new_words); // Return full last chunk
     }
 
     if (last_transcribed.empty()) {
@@ -107,24 +97,22 @@ std::string deduplicate_transcription(const std::string &new_text, bool is_final
 
     std::vector<std::string> old_words = split_words(last_transcribed);
 
-    // **Step 3: Search BACKWARD for the first matching word (exact match only)**
+    // **Step 2: Search BACKWARD for the first matching word**
     size_t match_index = old_words.size();
     std::string first_new_word = new_words.empty() ? "" : new_words[0];
 
     for (size_t i = old_words.size(); i-- > 0;) {  // Iterate backward
-        if (old_words[i] == first_new_word) {  // **Exact match only for first word**
+        if (old_words[i] == first_new_word || (levenshtein_distance(old_words[i], first_new_word) <= 1)) {
             match_index = i;
             break;
         }
     }
 
-    // **Step 4: Move FORWARD and remove overlapping words using Levenshtein**
+    // **Step 3: Move FORWARD and remove overlapping words**
     size_t trim_index = 0;
     while (trim_index < new_words.size() && match_index < old_words.size()) {
-        bool exact_match = (old_words[match_index] == new_words[trim_index]);
-        bool fuzzy_match = (!exact_match && levenshtein_distance(old_words[match_index], new_words[trim_index]) <= 1);
-
-        if (exact_match || fuzzy_match) {
+        if (old_words[match_index] == new_words[trim_index] ||
+            levenshtein_distance(old_words[match_index], new_words[trim_index]) <= 1) {
             trim_index++;  // Remove this word
             match_index++;
         } else {
@@ -132,10 +120,10 @@ std::string deduplicate_transcription(const std::string &new_text, bool is_final
         }
     }
 
-    // **Step 5: Trim overlapping words**
+    // **Step 4: Trim overlapping words**
     std::vector<std::string> deduped_words(new_words.begin() + trim_index, new_words.end());
 
-    // **Step 6: Store cleaned transcription & return result**
+    // **Step 5: Store cleaned transcription & return result**
     last_transcribed = join_words(new_words);
     return join_words(deduped_words);
 }
@@ -225,9 +213,8 @@ void stream_main(size_t index, int interval) {
                 }
             }
 
-            bool is_final_frame = g_is_final_frame;
             printf("pre-deduplicated transcribed: %s\n", text_heard.c_str());
-            text_heard = deduplicate_transcription(text_heard, is_final_frame);
+            text_heard = deduplicate_transcription(text_heard);
             printf("deduplicated transcribed: %s\n", text_heard.c_str());
 
             {
@@ -273,35 +260,32 @@ EMSCRIPTEN_BINDINGS(stream) {
         }
     }));
 
-// **Updated set_audio**
-emscripten::function("set_audio", emscripten::optional_override([](size_t index, const emscripten::val & audio, bool is_final_frame) {
-    --index;
+    emscripten::function("set_audio", emscripten::optional_override([](size_t index, const emscripten::val & audio) {
+        --index;
 
-    if (index >= g_contexts.size()) {
-        return -1;
-    }
+        if (index >= g_contexts.size()) {
+            return -1;
+        }
 
-    if (g_contexts[index] == nullptr) {
-        return -2;
-    }
+        if (g_contexts[index] == nullptr) {
+            return -2;
+        }
 
-    {
-        std::lock_guard<std::mutex> lock(g_mutex);
-        const int n = audio["length"].as<int>();
+        {
+            std::lock_guard<std::mutex> lock(g_mutex);
+            const int n = audio["length"].as<int>();
 
-        emscripten::val heap = emscripten::val::module_property("HEAPU8");
-        emscripten::val memory = heap["buffer"];
+            emscripten::val heap = emscripten::val::module_property("HEAPU8");
+            emscripten::val memory = heap["buffer"];
 
-        g_pcmf32.resize(n);
-        emscripten::val memoryView = audio["constructor"].new_(memory, reinterpret_cast<uintptr_t>(g_pcmf32.data()), n);
-        memoryView.call<void>("set", audio);
-    }
+            g_pcmf32.resize(n);
 
-    g_is_final_frame = is_final_frame; // Store final frame status for processing
+            emscripten::val memoryView = audio["constructor"].new_(memory, reinterpret_cast<uintptr_t>(g_pcmf32.data()), n);
+            memoryView.call<void>("set", audio);
+        }
 
-    return 0;
-}));
-
+        return 0;
+    }));
 
     emscripten::function("get_transcribed", emscripten::optional_override([]() {
         std::string transcribed;
