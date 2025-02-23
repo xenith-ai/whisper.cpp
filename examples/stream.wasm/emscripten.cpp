@@ -41,21 +41,18 @@ struct AudioChunk {
 
 std::vector<AudioChunk> g_audio_chunks;
 
-void stream_set_status(const std::string & status) {
-    std::lock_guard<std::mutex> lock(g_mutex);
-    g_status = status;
+std::string normalize_string(const std::string &str) {
+    std::string result;
+    for (char c : str) {
+        if (!std::ispunct(c)) {  // Remove punctuation
+            result += std::tolower(c);  // Convert to lowercase
+        }
+    }
+    return result;
 }
 
-// **Levenshtein Distance Calculation**
 int levenshtein_distance(const std::string &s1, const std::string &s2) {
-    // **Step 1: Normalize the strings by removing punctuation**
-    std::string norm_s1, norm_s2;
-    
-    for (char c : s1) if (!std::ispunct(c)) norm_s1 += c;
-    for (char c : s2) if (!std::ispunct(c)) norm_s2 += c;
-
-    // **Step 2: Compute Levenshtein distance on normalized strings**
-    const size_t len1 = norm_s1.size(), len2 = norm_s2.size();
+    const size_t len1 = s1.size(), len2 = s2.size();
     std::vector<std::vector<int>> d(len1 + 1, std::vector<int>(len2 + 1));
 
     for (size_t i = 0; i <= len1; i++) d[i][0] = i;
@@ -66,7 +63,7 @@ int levenshtein_distance(const std::string &s1, const std::string &s2) {
             d[i][j] = std::min({
                 d[i - 1][j] + 1,  // Deletion
                 d[i][j - 1] + 1,  // Insertion
-                d[i - 1][j - 1] + (norm_s1[i - 1] == norm_s2[j - 1] ? 0 : 1) // Substitution
+                d[i - 1][j - 1] + (s1[i - 1] == s2[j - 1] ? 0 : 1) // Substitution
             });
         }
     }
@@ -74,7 +71,21 @@ int levenshtein_distance(const std::string &s1, const std::string &s2) {
     return d[len1][len2];
 }
 
-// **Helper: Split a string into words**
+bool words_match(const std::string &s1, const std::string &s2, bool levenshtein_fallback) {
+    if (s1 == s2) return true;
+
+    std::string norm_s1 = normalize_string(s1);
+    std::string norm_s2 = normalize_string(s2);
+
+    if (norm_s1 == norm_s2) return true;
+
+    if (levenshtein_fallback) {
+        return levenshtein_distance(norm_s1, norm_s2) <= 1;  // Allow 1 small change
+    }
+
+    return false;
+}
+
 std::vector<std::string> split_words(const std::string &text) {
     std::istringstream stream(text);
     std::vector<std::string> words;
@@ -85,7 +96,6 @@ std::vector<std::string> split_words(const std::string &text) {
     return words;
 }
 
-// **Helper: Join words into a string**
 std::string join_words(const std::vector<std::string> &words, size_t start = 0) {
     std::ostringstream result;
     for (size_t i = start; i < words.size(); i++) {
@@ -95,11 +105,10 @@ std::string join_words(const std::vector<std::string> &words, size_t start = 0) 
     return result.str();
 }
 
-// **Deduplication Function**
 std::string deduplicate_transcription(const std::string &new_text, bool is_final) {
     std::vector<std::string> new_words = split_words(new_text);
 
-    // **Step 1: Remove last word from transcription to avoid cutoff words**
+    // Remove last word from transcription to avoid cutoff words
     if (!is_final && !new_words.empty()) {
         new_words.pop_back();
     }
@@ -111,22 +120,21 @@ std::string deduplicate_transcription(const std::string &new_text, bool is_final
 
     std::vector<std::string> old_words = split_words(last_transcribed);
 
-    // **Step 2: Search BACKWARD for the first matching word**
+    // Search BACKWARD for the first matching word
     size_t match_index = old_words.size();
     std::string first_new_word = new_words.empty() ? "" : new_words[0];
 
     for (size_t i = old_words.size(); i-- > 0;) {  // Iterate backward
-        if (old_words[i] == first_new_word || (levenshtein_distance(old_words[i], first_new_word) <= 1)) {
+        if (words_match(old_words[i], first_new_word, false)) { // Exact match only for the first word
             match_index = i;
             break;
         }
     }
 
-    // **Step 3: Move FORWARD and remove overlapping words**
+    // Move FORWARD and remove overlapping words
     size_t trim_index = 0;
     while (trim_index < new_words.size() && match_index < old_words.size()) {
-        if (old_words[match_index] == new_words[trim_index] ||
-            levenshtein_distance(old_words[match_index], new_words[trim_index]) <= 1) {
+        if (words_match(old_words[match_index], new_words[trim_index], true)) { // Exact match or levenshtein for overlapping words after first match
             trim_index++;  // Remove this word
             match_index++;
         } else {
@@ -134,10 +142,10 @@ std::string deduplicate_transcription(const std::string &new_text, bool is_final
         }
     }
 
-    // **Step 4: Trim overlapping words**
+    // Trim overlapping words
     std::vector<std::string> deduped_words(new_words.begin() + trim_index, new_words.end());
 
-    // **Step 5: Store cleaned transcription & return result**
+    // Store cleaned transcription & return result
     if (is_final) {
         last_transcribed.clear(); // Clear previous transcription
         g_audio_chunks.clear(); // Clear the 1-second buffer AFTER processing the final frame
@@ -147,9 +155,7 @@ std::string deduplicate_transcription(const std::string &new_text, bool is_final
     return join_words(deduped_words);
 }
 
-void stream_main(size_t index, int interval) {
-    stream_set_status("loading data ...");
-
+void stream_main(size_t index) {
     struct whisper_full_params wparams = whisper_full_default_params(whisper_sampling_strategy::WHISPER_SAMPLING_GREEDY);
 
     wparams.n_threads        = std::min(N_THREAD, (int) std::thread::hardware_concurrency());
@@ -174,12 +180,7 @@ void stream_main(size_t index, int interval) {
     // whisper context
     auto & ctx = g_contexts[index];
 
-    const int64_t window_samples = interval*WHISPER_SAMPLE_RATE; // N seconds of audio
-    const int64_t overlap_samples = WHISPER_SAMPLE_RATE;  // 1 second of overlap
-
     while (g_running) {
-        stream_set_status("waiting for audio ...");
-    
         {
             std::unique_lock<std::mutex> lock(g_mutex);
     
@@ -195,11 +196,9 @@ void stream_main(size_t index, int interval) {
     
             lock.unlock();
     
-            printf("Processing audio: is_final = %d, length = %lu\n", chunk.is_final, chunk.pcmf32.size());
-    
-            // **Sliding Buffer Logic**
+            // Sliding Buffer Logic
             std::vector<float> new_pcmf32;
-            const int64_t overlap_samples = WHISPER_SAMPLE_RATE;  // 1 second overlap
+            const int64_t overlap_samples = WHISPER_SAMPLE_RATE;  // 1s prepended overlap
     
             if (!pcmf32.empty() && pcmf32.size() > overlap_samples) {
                 new_pcmf32.insert(new_pcmf32.end(), pcmf32.end() - overlap_samples, pcmf32.end());
@@ -209,20 +208,11 @@ void stream_main(size_t index, int interval) {
     
             pcmf32 = std::move(new_pcmf32);
     
-            // Whisper processing
-            const auto t_start = std::chrono::high_resolution_clock::now();
-    
-            stream_set_status("running whisper ...");
-    
             int ret = whisper_full(ctx, wparams, pcmf32.data(), pcmf32.size());
             if (ret != 0) {
                 printf("whisper_full() failed: %d\n", ret);
                 break;
             }
-    
-            const auto t_end = std::chrono::high_resolution_clock::now();
-    
-            printf("stream: whisper_full() returned %d in %f seconds\n", ret, std::chrono::duration<double>(t_end - t_start).count());
     
             // Transcription processing
             std::string text_heard;
@@ -235,13 +225,14 @@ void stream_main(size_t index, int interval) {
             }
     
             text_heard = deduplicate_transcription(text_heard, chunk.is_final);
-    
+            printf("whisper: %s\n", text_heard.c_str());
+
             {
                 std::lock_guard<std::mutex> lock(g_mutex);
                 g_transcribed = text_heard;
             }
     
-            // **Clear buffer if final frame**
+            // Clear buffer if final frame
             if (chunk.is_final) {
                 pcmf32.clear();
             }
@@ -255,7 +246,7 @@ void stream_main(size_t index, int interval) {
 }
 
 EMSCRIPTEN_BINDINGS(stream) {
-    emscripten::function("init", emscripten::optional_override([](const std::string & path_model, int interval) {
+    emscripten::function("init", emscripten::optional_override([](const std::string & path_model) {
         for (size_t i = 0; i < g_contexts.size(); ++i) {
             if (g_contexts[i] == nullptr) {
                 g_contexts[i] = whisper_init_from_file_with_params(path_model.c_str(), whisper_context_default_params());
@@ -264,8 +255,8 @@ EMSCRIPTEN_BINDINGS(stream) {
                     if (g_worker.joinable()) {
                         g_worker.join();
                     }
-                    g_worker = std::thread([i, interval]() {
-                        stream_main(i, interval);
+                    g_worker = std::thread([i]() {
+                        stream_main(i);
                     });
 
                     return i + 1;
@@ -322,23 +313,5 @@ EMSCRIPTEN_BINDINGS(stream) {
         }
 
         return transcribed;
-    }));
-
-    emscripten::function("get_status", emscripten::optional_override([]() {
-        std::string status;
-
-        {
-            std::lock_guard<std::mutex> lock(g_mutex);
-            status = g_status_forced.empty() ? g_status : g_status_forced;
-        }
-
-        return status;
-    }));
-
-    emscripten::function("set_status", emscripten::optional_override([](const std::string & status) {
-        {
-            std::lock_guard<std::mutex> lock(g_mutex);
-            g_status_forced = status;
-        }
     }));
 }
