@@ -12,7 +12,7 @@
 #include <vector>
 #include <sstream>
 #include <algorithm>
-#include <regex>
+#include <queue>
 
 constexpr int N_THREAD = 8;
 
@@ -28,13 +28,18 @@ std::string g_status_forced = "";
 std::string g_transcribed   = "";
 std::string last_transcribed = "";
 
-std::vector<float> g_pcmf32;
-
 struct Segment {
     std::string text;
     int64_t start_time;  // Start time of the segment
     int64_t end_time;    // End time of the segment
 };
+
+struct AudioChunk {
+    std::vector<float> pcmf32;
+    bool is_final;
+};
+
+std::vector<AudioChunk> g_audio_chunks;
 
 void stream_set_status(const std::string & status) {
     std::lock_guard<std::mutex> lock(g_mutex);
@@ -83,10 +88,13 @@ std::string join_words(const std::vector<std::string> &words, size_t start = 0) 
 }
 
 // **Deduplication Function**
-std::string deduplicate_transcription(const std::string &new_text) {
-    // **Step 1: Remove last word from transcription to avoid cutoff words**
+std::string deduplicate_transcription(const std::string &new_text, bool is_final) {
     std::vector<std::string> new_words = split_words(new_text);
-    if (!new_words.empty()) {
+
+    printf("deduplication is_final param: %d\n", is_final);
+
+    // **Step 1: Remove last word from transcription to avoid cutoff words**
+    if (!is_final && !new_words.empty()) {
         new_words.pop_back();
     }
 
@@ -124,7 +132,12 @@ std::string deduplicate_transcription(const std::string &new_text) {
     std::vector<std::string> deduped_words(new_words.begin() + trim_index, new_words.end());
 
     // **Step 5: Store cleaned transcription & return result**
-    last_transcribed = join_words(new_words);
+    if (is_final) {
+        last_transcribed.clear(); // Clear previous transcription
+        g_audio_chunks.clear(); // Clear the 1-second buffer AFTER processing the final frame
+    } else {
+        last_transcribed = join_words(new_words);
+    }
     return join_words(deduped_words);
 }
 
@@ -160,66 +173,73 @@ void stream_main(size_t index, int interval) {
 
     while (g_running) {
         stream_set_status("waiting for audio ...");
-
+    
         {
             std::unique_lock<std::mutex> lock(g_mutex);
-
-            if (g_pcmf32.size() < 1024) {
+    
+            if (g_audio_chunks.empty()) {
                 lock.unlock();
                 std::this_thread::sleep_for(std::chrono::milliseconds(10));
                 continue;
             }
-
-            // Keep the last 1 second of previous audio and append the new 2 seconds
+    
+            // Get next chunk
+            AudioChunk chunk = std::move(g_audio_chunks.front());
+            g_audio_chunks.erase(g_audio_chunks.begin());
+    
+            lock.unlock();
+    
+            printf("Processing audio: is_final = %d, length = %lu\n", chunk.is_final, chunk.pcmf32.size());
+    
+            // **Sliding Buffer Logic**
             std::vector<float> new_pcmf32;
-
-            if (pcmf32.size() > overlap_samples) {
+            const int64_t overlap_samples = WHISPER_SAMPLE_RATE;  // 1 second overlap
+    
+            if (!pcmf32.empty() && pcmf32.size() > overlap_samples) {
                 new_pcmf32.insert(new_pcmf32.end(), pcmf32.end() - overlap_samples, pcmf32.end());
             }
-
-            new_pcmf32.insert(new_pcmf32.end(), g_pcmf32.begin(), g_pcmf32.end());
-
+    
+            new_pcmf32.insert(new_pcmf32.end(), chunk.pcmf32.begin(), chunk.pcmf32.end());
+    
             pcmf32 = std::move(new_pcmf32);
-            g_pcmf32.clear();  // Clear new buffer after adding it
-        }
-
-        {
+    
+            // Whisper processing
             const auto t_start = std::chrono::high_resolution_clock::now();
-
+    
             stream_set_status("running whisper ...");
-
+    
             int ret = whisper_full(ctx, wparams, pcmf32.data(), pcmf32.size());
             if (ret != 0) {
                 printf("whisper_full() failed: %d\n", ret);
                 break;
             }
-
+    
             const auto t_end = std::chrono::high_resolution_clock::now();
-
+    
             printf("stream: whisper_full() returned %d in %f seconds\n", ret, std::chrono::duration<double>(t_end - t_start).count());
-        }
-
-        {
+    
+            // Transcription processing
             std::string text_heard;
-
             {
                 const int n_segments = whisper_full_n_segments(ctx);
                 for (int i = n_segments - 1; i < n_segments; ++i) {
                     const char * text = whisper_full_get_segment_text(ctx, i);
-
-                    //printf("transcribed: %s\n", text);
-
                     text_heard += text;
                 }
             }
-
+    
             printf("pre-deduplicated transcribed: %s\n", text_heard.c_str());
-            text_heard = deduplicate_transcription(text_heard);
+            text_heard = deduplicate_transcription(text_heard, chunk.is_final);
             printf("deduplicated transcribed: %s\n", text_heard.c_str());
-
+    
             {
                 std::lock_guard<std::mutex> lock(g_mutex);
                 g_transcribed = text_heard;
+            }
+    
+            // **Clear buffer if final frame**
+            if (chunk.is_final) {
+                pcmf32.clear();
             }
         }
     }
@@ -260,7 +280,9 @@ EMSCRIPTEN_BINDINGS(stream) {
         }
     }));
 
-    emscripten::function("set_audio", emscripten::optional_override([](size_t index, const emscripten::val & audio) {
+    emscripten::function("set_audio", emscripten::optional_override([](size_t index, const emscripten::val & audio, bool is_final) {
+        printf("set_audio is_final param: %d\n", is_final);
+
         --index;
 
         if (index >= g_contexts.size()) {
@@ -274,14 +296,16 @@ EMSCRIPTEN_BINDINGS(stream) {
         {
             std::lock_guard<std::mutex> lock(g_mutex);
             const int n = audio["length"].as<int>();
-
+    
             emscripten::val heap = emscripten::val::module_property("HEAPU8");
             emscripten::val memory = heap["buffer"];
-
-            g_pcmf32.resize(n);
-
-            emscripten::val memoryView = audio["constructor"].new_(memory, reinterpret_cast<uintptr_t>(g_pcmf32.data()), n);
+    
+            std::vector<float> pcmf32(n);
+            emscripten::val memoryView = audio["constructor"].new_(memory, reinterpret_cast<uintptr_t>(pcmf32.data()), n);
             memoryView.call<void>("set", audio);
+    
+            // Push audio + is_final flag as a single struct
+            g_audio_chunks.push_back({std::move(pcmf32), is_final});
         }
 
         return 0;
