@@ -99,8 +99,6 @@ std::string join_words(const std::vector<std::string> &words, size_t start = 0) 
 std::string deduplicate_transcription(const std::string &new_text, bool is_final) {
     std::vector<std::string> new_words = split_words(new_text);
 
-    printf("deduplication is_final param: %d\n", is_final);
-
     // **Step 1: Remove last word from transcription to avoid cutoff words**
     if (!is_final && !new_words.empty()) {
         new_words.pop_back();
@@ -236,9 +234,7 @@ void stream_main(size_t index, int interval) {
                 }
             }
     
-            printf("pre-deduplicated transcribed: %s\n", text_heard.c_str());
             text_heard = deduplicate_transcription(text_heard, chunk.is_final);
-            printf("deduplicated transcribed: %s\n", text_heard.c_str());
     
             {
                 std::lock_guard<std::mutex> lock(g_mutex);
@@ -289,8 +285,6 @@ EMSCRIPTEN_BINDINGS(stream) {
     }));
 
     emscripten::function("set_audio", emscripten::optional_override([](size_t index, const emscripten::val & audio, bool is_final) {
-        printf("set_audio is_final param: %d\n", is_final);
-
         --index;
 
         if (index >= g_contexts.size()) {
