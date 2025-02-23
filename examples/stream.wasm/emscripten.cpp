@@ -48,7 +48,14 @@ void stream_set_status(const std::string & status) {
 
 // **Levenshtein Distance Calculation**
 int levenshtein_distance(const std::string &s1, const std::string &s2) {
-    const size_t len1 = s1.size(), len2 = s2.size();
+    // **Step 1: Normalize the strings by removing punctuation**
+    std::string norm_s1, norm_s2;
+    
+    for (char c : s1) if (!std::ispunct(c)) norm_s1 += c;
+    for (char c : s2) if (!std::ispunct(c)) norm_s2 += c;
+
+    // **Step 2: Compute Levenshtein distance on normalized strings**
+    const size_t len1 = norm_s1.size(), len2 = norm_s2.size();
     std::vector<std::vector<int>> d(len1 + 1, std::vector<int>(len2 + 1));
 
     for (size_t i = 0; i <= len1; i++) d[i][0] = i;
@@ -59,10 +66,11 @@ int levenshtein_distance(const std::string &s1, const std::string &s2) {
             d[i][j] = std::min({
                 d[i - 1][j] + 1,  // Deletion
                 d[i][j - 1] + 1,  // Insertion
-                d[i - 1][j - 1] + (s1[i - 1] == s2[j - 1] ? 0 : 1) // Substitution
+                d[i - 1][j - 1] + (norm_s1[i - 1] == norm_s2[j - 1] ? 0 : 1) // Substitution
             });
         }
     }
+
     return d[len1][len2];
 }
 
