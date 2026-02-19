@@ -5,8 +5,24 @@
 
 #include <vector>
 #include <thread>
+#include <string>
+#include <sstream>
 
 std::thread g_worker;
+
+// Escape for JSON string values
+static std::string json_escape(const std::string &s) {
+    std::string out;
+    out.reserve(s.size() + 8);
+    for (char c : s) {
+        if (c == '\\') out += "\\\\";
+        else if (c == '"') out += "\\\"";
+        else if (c == '\n') out += "\\n";
+        else if (c == '\r') out += "\\r";
+        else out += c;
+    }
+    return out;
+}
 
 std::vector<struct whisper_context *> g_contexts(4, nullptr);
 
@@ -49,7 +65,7 @@ EMSCRIPTEN_BINDINGS(whisper) {
         }
     }));
 
-    emscripten::function("full_default", emscripten::optional_override([](size_t index, const emscripten::val & audio, const std::string & lang, int nthreads, bool translate) {
+    emscripten::function("full_default", emscripten::optional_override([](size_t index, const emscripten::val & audio, const std::string & lang, int nthreads, bool translate) -> std::string {
         if (g_worker.joinable()) {
             g_worker.join();
         }
@@ -57,23 +73,27 @@ EMSCRIPTEN_BINDINGS(whisper) {
         --index;
 
         if (index >= g_contexts.size()) {
-            return -1;
+            return "{\"status\":-1,\"segments\":[]}";
         }
 
         if (g_contexts[index] == nullptr) {
-            return -2;
+            return "{\"status\":-2,\"segments\":[]}";
         }
 
         struct whisper_full_params params = whisper_full_default_params(whisper_sampling_strategy::WHISPER_SAMPLING_GREEDY);
 
         params.print_realtime   = true;
         params.print_progress   = false;
-        params.print_timestamps = true;
+        params.print_timestamps  = true;
         params.print_special    = false;
         params.translate        = translate;
         params.language         = whisper_is_multilingual(g_contexts[index]) ? lang.c_str() : "en";
         params.n_threads        = std::min(nthreads, std::min(16, mpow2(std::thread::hardware_concurrency())));
         params.offset_ms        = 0;
+        // Word-level segments: one segment per word with start/end timestamps
+        params.token_timestamps = true;
+        params.split_on_word    = true;
+        params.max_len          = 1;
 
         std::vector<float> pcmf32;
         const int n = audio["length"].as<int>();
@@ -100,15 +120,59 @@ EMSCRIPTEN_BINDINGS(whisper) {
             printf("\n");
         }
 
-        // run the worker
-        {
-            g_worker = std::thread([index, params, pcmf32 = std::move(pcmf32)]() {
-                whisper_reset_timings(g_contexts[index]);
-                whisper_full(g_contexts[index], params, pcmf32.data(), pcmf32.size());
-                whisper_print_timings(g_contexts[index]);
-            });
-        }
+#ifdef __EMSCRIPTEN__
+        // Run on main thread: g_worker.join() hangs (pthread worker never signals completion / deadlock).
+        // Single-threaded so we don't spawn a pthread at all.
+        params.n_threads = 1;
+        printf("full_default: [emscripten] running whisper_full on main thread (no pthread)\n");
+        fflush(stdout);
+        whisper_reset_timings(g_contexts[index]);
+        whisper_full(g_contexts[index], params, pcmf32.data(), pcmf32.size());
+        printf("full_default: whisper_full returned, printing timings\n");
+        fflush(stdout);
+        whisper_print_timings(g_contexts[index]);
+        printf("full_default: collecting segments\n");
+        fflush(stdout);
+#else
+        printf("full_default: starting worker thread\n");
+        fflush(stdout);
+        g_worker = std::thread([index, params, pcmf32 = std::move(pcmf32)]() {
+            printf("full_default worker: thread started, calling whisper_full\n");
+            fflush(stdout);
+            whisper_reset_timings(g_contexts[index]);
+            whisper_full(g_contexts[index], params, pcmf32.data(), pcmf32.size());
+            printf("full_default worker: whisper_full returned, printing timings\n");
+            fflush(stdout);
+            whisper_print_timings(g_contexts[index]);
+            printf("full_default worker: thread exiting\n");
+            fflush(stdout);
+        });
+        printf("full_default: calling g_worker.join() ...\n");
+        fflush(stdout);
+        g_worker.join();
+        printf("full_default: join() returned, collecting segments\n");
+        fflush(stdout);
+#endif
 
-        return 0;
+        // t0/t1 from whisper API are in centiseconds (100 = 1 sec); convert to seconds for JSON
+        auto * ctx = g_contexts[index];
+        const int n_segments = whisper_full_n_segments(ctx);
+        printf("full_default: n_segments = %d\n", n_segments);
+        fflush(stdout);
+        std::ostringstream json;
+        json << "{\"status\":0,\"segments\":[";
+        for (int i = 0; i < n_segments; ++i) {
+            const char * text = whisper_full_get_segment_text(ctx, i);
+            const int64_t t0  = whisper_full_get_segment_t0(ctx, i);
+            const int64_t t1  = whisper_full_get_segment_t1(ctx, i);
+            if (i > 0) json << ",";
+            json << "{\"text\":\"" << json_escape(text ? text : "")
+                 << "\",\"t0\":" << (t0 / 100.0)
+                 << ",\"t1\":" << (t1 / 100.0) << "}";
+        }
+        json << "]}";
+        printf("full_default: built JSON (%zu bytes), returning\n", json.str().size());
+        fflush(stdout);
+        return json.str();
     }));
 }
