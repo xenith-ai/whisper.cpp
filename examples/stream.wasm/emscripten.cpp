@@ -27,6 +27,7 @@ std::string g_status        = "";
 std::string g_status_forced = "";
 std::string g_transcribed   = "";
 std::string last_transcribed = "";
+bool g_last_was_final       = false;
 
 struct Segment {
     std::string text;
@@ -40,6 +41,11 @@ struct AudioChunk {
 };
 
 std::vector<AudioChunk> g_audio_chunks;
+
+// Lookback duration in seconds (prepended overlap per chunk). Default 1.0s.
+std::vector<double> g_lookback_seconds(4, 1.0);
+// Hard minimum: process only when we have at least this much audio.
+constexpr int64_t MIN_PROCESSING_SAMPLES = WHISPER_SAMPLE_RATE;  // 1s
 
 std::string normalize_string(const std::string &str) {
     std::string result;
@@ -196,31 +202,36 @@ void stream_main(size_t index) {
     
             lock.unlock();
     
-            // Sliding Buffer Logic
+            // Sliding Buffer Logic: prepend overlap (or all previous if accumulating), then append chunk
             std::vector<float> new_pcmf32;
-            const int64_t overlap_samples = WHISPER_SAMPLE_RATE;  // 1s prepended overlap
-    
-            if (!pcmf32.empty() && pcmf32.size() > overlap_samples) {
-                new_pcmf32.insert(new_pcmf32.end(), pcmf32.end() - overlap_samples, pcmf32.end());
+            const double lookback_sec = (index < g_lookback_seconds.size()) ? g_lookback_seconds[index] : 1.0;
+            const int64_t overlap_samples = static_cast<int64_t>(lookback_sec * WHISPER_SAMPLE_RATE);
+            if (!pcmf32.empty()) {
+                size_t take = (overlap_samples <= 0 || pcmf32.size() <= (size_t)overlap_samples)
+                    ? pcmf32.size()
+                    : (size_t)overlap_samples;
+                new_pcmf32.insert(new_pcmf32.end(), pcmf32.end() - take, pcmf32.end());
             }
-    
             new_pcmf32.insert(new_pcmf32.end(), chunk.pcmf32.begin(), chunk.pcmf32.end());
-    
             pcmf32 = std::move(new_pcmf32);
-    
+            if (pcmf32.size() < (size_t)MIN_PROCESSING_SAMPLES) {
+                continue;  // hard minimum 1s; less causes memory access OOB
+            }
             int ret = whisper_full(ctx, wparams, pcmf32.data(), pcmf32.size());
             if (ret != 0) {
                 printf("whisper_full() failed: %d\n", ret);
                 break;
             }
     
-            // Transcription processing
+            // Transcription processing (skip when no segments — get_segment_*(ctx, -1) would OOB)
             std::string text_heard;
             {
                 const int n_segments = whisper_full_n_segments(ctx);
-                for (int i = n_segments - 1; i < n_segments; ++i) {
-                    const char * text = whisper_full_get_segment_text(ctx, i);
-                    text_heard += text;
+                if (n_segments > 0) {
+                    for (int i = n_segments - 1; i < n_segments; ++i) {
+                        const char * text = whisper_full_get_segment_text(ctx, i);
+                        text_heard += text;
+                    }
                 }
             }
     
@@ -229,10 +240,14 @@ void stream_main(size_t index) {
 
             {
                 std::lock_guard<std::mutex> lock(g_mutex);
-                g_transcribed = text_heard;
+                g_transcribed   = text_heard;
+                g_last_was_final = chunk.is_final;
             }
-    
-            // Clear buffer if final frame
+            // Keep overlap for next run; if buffer smaller than overlap, keep all
+            if (overlap_samples > 0 && pcmf32.size() >= (size_t)overlap_samples) {
+                std::vector<float> tail(pcmf32.end() - overlap_samples, pcmf32.end());
+                pcmf32 = std::move(tail);
+            }
             if (chunk.is_final) {
                 pcmf32.clear();
             }
@@ -246,9 +261,13 @@ void stream_main(size_t index) {
 }
 
 EMSCRIPTEN_BINDINGS(stream) {
-    emscripten::function("init", emscripten::optional_override([](const std::string & path_model) {
+    emscripten::function("init", emscripten::optional_override([](const std::string & path_model, double lookback_seconds) {
+        if (lookback_seconds < 0.0) {
+            lookback_seconds = 0.0;
+        }
         for (size_t i = 0; i < g_contexts.size(); ++i) {
             if (g_contexts[i] == nullptr) {
+                g_lookback_seconds[i] = lookback_seconds;
                 g_contexts[i] = whisper_init_from_file_with_params(path_model.c_str(), whisper_context_default_params());
                 if (g_contexts[i] != nullptr) {
                     g_running = true;
@@ -289,15 +308,11 @@ EMSCRIPTEN_BINDINGS(stream) {
         {
             std::lock_guard<std::mutex> lock(g_mutex);
             const int n = audio["length"].as<int>();
-    
             emscripten::val heap = emscripten::val::module_property("HEAPU8");
             emscripten::val memory = heap["buffer"];
-    
             std::vector<float> pcmf32(n);
             emscripten::val memoryView = audio["constructor"].new_(memory, reinterpret_cast<uintptr_t>(pcmf32.data()), n);
             memoryView.call<void>("set", audio);
-    
-            // Push audio + is_final flag as a single struct
             g_audio_chunks.push_back({std::move(pcmf32), is_final});
         }
 
@@ -313,5 +328,10 @@ EMSCRIPTEN_BINDINGS(stream) {
         }
 
         return transcribed;
+    }));
+
+    emscripten::function("get_last_transcription_was_final", emscripten::optional_override([]() {
+        std::lock_guard<std::mutex> lock(g_mutex);
+        return g_last_was_final;
     }));
 }
